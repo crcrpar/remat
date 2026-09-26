@@ -24,6 +24,7 @@ from torch_remat._oom import (  # noqa: F401
     format_oom_saved_tensors_report,
     oom_observer,
 )
+from torch_remat._offload import cpu_offload  # noqa: F401
 from torch_remat._region import (  # noqa: F401
     is_recomputing,
     name_scope,

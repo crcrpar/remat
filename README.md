@@ -60,6 +60,8 @@ def forward(self, hidden_states):
 
 The interaction between recompute and save regions is somewhat subtle;
 check [Mental model](docs/mental_model.md) for more details.
+To place selected SAVE-region activations in CPU memory, use
+[`remat.cpu_offload()`](docs/offloading.md) inside the checkpoint body.
 
 ## `torch.compile`
 

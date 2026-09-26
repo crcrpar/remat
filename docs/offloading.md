@@ -4,6 +4,73 @@
 live across forward and replay/backward. CPU offloading is the main use case,
 but the interface can also support compression, logging, or custom storage.
 
+## Built-in synchronous CPU offload
+
+Use `cpu_offload()` inside a checkpoint body around SAVE regions whose
+activations are expensive to recompute but costly to retain on CUDA:
+
+```python
+def block(x):
+    with remat.cpu_offload():
+        y = remat.region(expensive_op, "expensive", recompute=False)(x)
+    remat.recompute_needs_tensor(y)
+    return torch.relu(y)
+
+output = remat.checkpoint(region_name="block")(block)(x)
+```
+
+Only the selected SAVE region's retained tensors move to CPU. The checkpoint
+input and ordinary RECOMPUTE regions keep their existing behavior. The copy is
+synchronous in each direction; use custom hooks below when transfer overlap or
+prefetching is needed. Host memory must hold the offloaded tensors until their
+last use.
+
+The region policy chooses *whether* to recreate an activation. The offload
+context chooses *where* retained activations live. An expensive call that would
+normally recompute can therefore be changed to `recompute=False` and placed
+inside `cpu_offload()` without changing the policy of other calls in the
+checkpoint. The context uses PyTorch saved-tensor hooks, so it also works
+outside a checkpoint for ordinary autograd saves.
+
+| Policy for a call | After-forward storage | Work before backward uses it |
+| --- | --- | --- |
+| `recompute=True` | No saved intermediates from that call | Rerun the call |
+| `recompute=False` | Retained tensors on their original device | Load resident tensors |
+| `recompute=False` inside `cpu_offload()` | Retained CUDA tensors on CPU | Copy them back to CUDA |
+
+Place the context *inside* the checkpoint body if checkpoint inputs should stay
+on CUDA. Enclosing the checkpoint call itself also applies ordinary saved-tensor
+hooks to its input anchors. A saved output needed by a later recomputed call may
+be packed after the context exits; remat still remembers the offload policy
+active where that output was produced.
+
+## Choosing a policy
+
+CPU offload is a way to reduce retained CUDA memory, not an established
+training-throughput improvement over recomputation. No end-to-end training
+comparison has demonstrated a speedup for this API. Simple single-region
+probes favored recomputation; they do not predict a compute-heavy workload.
+Synchronous offload can help throughput only when avoided recomputation costs
+more than both transfers and their synchronization, or when saved CUDA memory
+enables a more efficient batch size. Compare end-to-end tokens per second under
+the same model, sequence length, batch size, and parallelism before changing a
+training policy for speed. If offload permits a larger batch, compare the best
+feasible configurations as a separate capacity-driven result.
+
+Count all retained tensors across in-flight checkpoint regions against host
+memory. The forward copy needs both the original CUDA tensor and its CPU copy
+until the transfer finishes. Backward similarly allocates a CUDA copy before
+the CPU payload can be released. Offload therefore lowers memory *between*
+forward and backward, while instantaneous peak memory can still include
+temporary copies. The built-in context does not prefetch or overlap transfers;
+the custom hook interface below is the place for a workload-specific transfer
+schedule.
+
+Saved-tensor hooks are eager-only in `torch_remat`; `torch.compile` does not
+support this offload context inside compiled checkpoints. Retained regions with
+random or external state still need appropriate `recompute_state_hooks`, just
+as they do without offloading.
+
 ## Basic hook pair
 
 A pack hook replaces a saved tensor with an opaque payload. The matching unpack

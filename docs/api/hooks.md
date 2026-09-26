@@ -5,6 +5,8 @@
 ```{eval-rst}
 .. autofunction:: torch_remat.saved_tensors_hooks
 
+.. autofunction:: torch_remat.cpu_offload
+
 .. autofunction:: torch_remat.current_saved_tensor_info
 
 .. autoclass:: torch_remat.SavedTensorInfo
