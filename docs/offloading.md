@@ -21,9 +21,8 @@ output = remat.checkpoint(region_name="block")(block)(x)
 
 Only the selected SAVE region's retained tensors move to CPU. The checkpoint
 input and ordinary RECOMPUTE regions keep their existing behavior. The copy is
-synchronous in each direction; use custom hooks below when transfer overlap or
-prefetching is needed. Host memory must hold the offloaded tensors until their
-last use.
+synchronous in each direction. Host memory must hold the offloaded tensors until
+their last use.
 
 The region policy chooses *whether* to recreate an activation. The offload
 context chooses *where* retained activations live. An expensive call that would
@@ -44,13 +43,74 @@ hooks to its input anchors. A saved output needed by a later recomputed call may
 be packed after the context exits; remat still remembers the offload policy
 active where that output was produced.
 
+## Bounded eager transfers and prefetch
+
+For eager training, share a `CpuOffloader` across selected contexts. It copies
+into pinned host memory on a separate CUDA stream, retains the source GPU
+storage until that copy finishes, and lets recompute queue reloads before they
+are consumed:
+
+```python
+offloader = remat.CpuOffloader(
+    max_host_bytes=4 * 1024**3,
+    max_prefetch_bytes=256 * 1024**2,
+    min_offload_bytes=1 * 1024**2,
+)
+
+def block(x):
+    if remat.is_recomputing():
+        offloader.prefetch()
+    with remat.cpu_offload(offloader=offloader):
+        y = remat.region(expensive_op, "expensive", recompute=False)(x)
+    remat.recompute_needs_tensor(y)
+    return torch.relu(y)
+```
+
+`prefetch()` selects live payloads from the active checkpoint and queues the
+newest saves first, up to `max_prefetch_bytes`; it returns the number of bytes
+queued. `min_offload_bytes` keeps smaller saved CUDA tensors on GPU and
+offloads tensors whose logical size is at least the threshold. The default is
+zero, which offloads every selected CUDA tensor as before. Tensors kept on GPU
+use no host reservation or prefetch budget. Call `prefetch()` early enough in
+recompute to overlap the reload with useful
+compute. A payload larger than the prefetch limit reloads on demand. Without a
+prefetch call, every payload reloads on demand. On-demand reload runs on the
+consuming CUDA stream, so its copy must finish before that stream uses the
+tensor. Profile copy and compute overlap on the intended workload; asynchronous
+enqueue alone does not imply overlap. The host limit
+counts live payloads and copies still in flight; exceeding it raises
+`MemoryError` before another pinned allocation. Use one shared object for a
+model or training step when the limit must cover several checkpoint calls.
+The host limit reserves each payload at the next power-of-two byte size to
+account conservatively for PyTorch's pinned allocator. It limits live and
+in-flight payloads managed by this object, **not** the physical pinned pool:
+PyTorch may cache released blocks, and other code may pin memory. Allow
+system-level headroom and monitor `torch.cuda.host_memory_stats()` where
+available. Recent PyTorch versions provide
+`torch.accelerator.memory.empty_host_cache()` to release unused cached blocks
+when needed; trimming between steps can add pinning overhead. GPU peak memory
+can include source tensors while offload is in flight and prefetched copies
+before they are consumed. A saved tensor still needs GPU space when its backward
+consumer reads it; offload cannot make a tensor usable if even that temporary
+residency exceeds available GPU memory. Choose the prefetch limit from the
+measured GPU peak, since an aggressive limit can erase the memory benefit.
+
+The asynchronous path preserves strides for dense views. Views with gaps,
+broadcast views, and other overlapping views are materialized as dense
+payloads; budget for their logical element count, which may exceed their
+original storage size. A compiled consumer may specialize on the original
+stride, so this eager offloader is not supported inside compiled modules.
+
+`CpuOffloader` is eager-only. Compiled execution uses the graph-level PyTorch
+offloader described below.
+
 ## Choosing a policy
 
 CPU offload is a way to reduce retained CUDA memory, not an established
 training-throughput improvement over recomputation. No end-to-end training
 comparison has demonstrated a speedup for this API. Simple single-region
 probes favored recomputation; they do not predict a compute-heavy workload.
-Synchronous offload can help throughput only when avoided recomputation costs
+Offload can help throughput only when avoided recomputation costs
 more than both transfers and their synchronization, or when saved CUDA memory
 enables a more efficient batch size. Compare end-to-end tokens per second under
 the same model, sequence length, batch size, and parallelism before changing a
@@ -62,14 +122,27 @@ memory. The forward copy needs both the original CUDA tensor and its CPU copy
 until the transfer finishes. Backward similarly allocates a CUDA copy before
 the CPU payload can be released. Offload therefore lowers memory *between*
 forward and backward, while instantaneous peak memory can still include
-temporary copies. The built-in context does not prefetch or overlap transfers;
-the custom hook interface below is the place for a workload-specific transfer
-schedule.
+temporary copies. The synchronous default does not prefetch or overlap
+transfers. `CpuOffloader` provides bounded asynchronous transfers and an
+explicit prefetch point; workload-specific schedules can use the custom hook
+interface below.
 
-Saved-tensor hooks are eager-only in `torch_remat`; `torch.compile` does not
-support this offload context inside compiled checkpoints. Retained regions with
-random or external state still need appropriate `recompute_state_hooks`, just
-as they do without offloading.
+Under `torch.compile`, this context annotates selected SAVE-region graph nodes
+for PyTorch's experimental compiled activation offloader. Enable
+`torch._functorch.config.enable_activation_offloading` around the **first
+compiled invocation**; PyTorch compiles lazily, so enabling it only around
+`torch.compile(...)` is insufficient. The config must remain enabled when a
+new graph is compiled. Compilation raises if the feature is unavailable or
+disabled, or if the context is outside a compiled `remat.checkpoint` body.
+
+PyTorch also exposes experimental `activation_offload_separate_stream` and
+`activation_reload_prefetch` settings. These belong to PyTorch's compiled
+offloader, not this eager hook implementation. Compile support here marks
+eligible nodes; PyTorch's partitioner decides which marked nodes are saved and
+offloaded. The feature is still experimental and requires correctness, memory,
+and throughput validation on the actual compiled model before training use.
+Retained regions with random or external state still need appropriate
+`recompute_state_hooks`, just as they do without offloading.
 
 ## Basic hook pair
 

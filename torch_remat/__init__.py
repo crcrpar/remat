@@ -25,6 +25,7 @@ from torch_remat._oom import (  # noqa: F401
     oom_observer,
 )
 from torch_remat._offload import cpu_offload  # noqa: F401
+from torch_remat._offload_async import CpuOffloader  # noqa: F401
 from torch_remat._region import (  # noqa: F401
     is_recomputing,
     name_scope,

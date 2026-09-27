@@ -7,6 +7,9 @@
 
 .. autofunction:: torch_remat.cpu_offload
 
+.. autoclass:: torch_remat.CpuOffloader
+   :members:
+
 .. autofunction:: torch_remat.current_saved_tensor_info
 
 .. autoclass:: torch_remat.SavedTensorInfo

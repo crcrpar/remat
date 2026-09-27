@@ -41,7 +41,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-import torch
 from torch._higher_order_ops.wrap import dynamo_bypassing_wrapper
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint, CheckpointPolicy
 
@@ -82,6 +81,8 @@ def _tag_must_save(inner_fn: Callable[..., Any]) -> Callable[..., Any]:
         for node in list(graph.nodes)[num_nodes_before:]:
             if node.op == "call_function":
                 node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+                if node.meta.get("custom", {}).get("should_offload"):
+                    node.meta["should_offload"] = True
         return output
 
     return run
